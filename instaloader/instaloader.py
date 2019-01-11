@@ -1,5 +1,6 @@
 import getpass
 import json
+import lzma
 import os
 import platform
 import re
@@ -10,12 +11,13 @@ import tempfile
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from functools import wraps
+from hashlib import md5
 from io import BytesIO
 from typing import Any, Callable, Iterator, List, Optional, Set, Union
 
 from .exceptions import *
 from .instaloadercontext import InstaloaderContext
-from .structures import Highlight, JsonExportable, Post, PostLocation, Profile, Story, StoryItem, save_structure_to_file
+from .structures import Highlight, JsonExportable, Post, PostLocation, Profile, Story, StoryItem, save_structure_to_file, load_structure_from_file
 
 
 def get_default_session_filename(username: str) -> str:
@@ -95,6 +97,7 @@ class Instaloader:
        txt file.
     :param storyitem_metadata_txt_pattern: :option:`--storyitem-metadata-txt`, default is empty (=none)
     :param max_connection_attempts: :option:`--max-connection-attempts`
+    :param commit_mode: :option:`--commit-mode`
 
     .. attribute:: context
 
@@ -116,7 +119,8 @@ class Instaloader:
                  post_metadata_txt_pattern: str = None,
                  storyitem_metadata_txt_pattern: str = None,
                  graphql_rate_limit: Optional[int] = None,
-                 max_connection_attempts: int = 3):
+                 max_connection_attempts: int = 3,
+                 commit_mode: bool = False):
 
         self.context = InstaloaderContext(sleep, quiet, user_agent, graphql_rate_limit, max_connection_attempts)
 
@@ -134,6 +138,12 @@ class Instaloader:
             else post_metadata_txt_pattern
         self.storyitem_metadata_txt_pattern = '' if storyitem_metadata_txt_pattern is None \
             else storyitem_metadata_txt_pattern
+        self.commit_mode = commit_mode
+        if self.commit_mode and not self.save_metadata:
+            raise InvalidArgumentException("Commit mode requires JSON metadata to be saved.")
+
+        # Used to keep state in commit mode
+        self._committed = None
 
     @contextmanager
     def anonymous_copy(self):
@@ -173,9 +183,15 @@ class Instaloader:
         if filename_suffix is not None:
             filename += '_' + filename_suffix
         filename += '.' + file_extension
-        if os.path.isfile(filename):
-            self.context.log(filename + ' exists', end=' ', flush=True)
-            return False
+        # A post is considered "commited" if the json file exists and is not malformed.
+        if self.commit_mode:
+            if self._committed and os.path.isfile(filename):
+                self.context.log(filename + ' exists', end=' ', flush=True)
+                return False
+        else:
+            if os.path.isfile(filename):
+                self.context.log(filename + ' exists', end=' ', flush=True)
+                return False
         self.context.get_and_write_raw(url, filename)
         os.utime(filename, (datetime.now().timestamp(), mtime.timestamp()))
         return True
@@ -239,8 +255,7 @@ class Instaloader:
                 return None
             else:
                 def get_filename(index):
-                    return filename if index == 0 else (filename[:-4] + '_old_' +
-                                                        (str(0) if index < 10 else str()) + str(index) + filename[-4:])
+                    return filename if index == 0 else '{0}_old_{2:02}{1}'.format(*os.path.splitext(filename), index)
 
                 i = 0
                 while os.path.isfile(get_filename(i)):
@@ -274,26 +289,32 @@ class Instaloader:
         """Downloads and saves profile pic."""
 
         def _epoch_to_string(epoch: datetime) -> str:
-            return epoch.strftime('%Y-%m-%d_%H-%M-%S')
+            return epoch.strftime('%Y-%m-%d_%H-%M-%S_UTC')
 
-        profile_pic_url = profile.profile_pic_url
-        with self.context.get_anonymous_session() as anonymous_session:
-            date_object = datetime.strptime(anonymous_session.head(profile_pic_url).headers["Last-Modified"],
-                                            '%a, %d %b %Y %H:%M:%S GMT')
+        profile_pic_response = self.context.get_raw(profile.profile_pic_url)
+        if 'Last-Modified' in profile_pic_response.headers:
+            date_object = datetime.strptime(profile_pic_response.headers["Last-Modified"], '%a, %d %b %Y %H:%M:%S GMT')
+            profile_pic_bytes = None
+            profile_pic_identifier = _epoch_to_string(date_object)
+        else:
+            date_object = None
+            profile_pic_bytes = profile_pic_response.content
+            profile_pic_identifier = md5(profile_pic_bytes).hexdigest()[:16]
         profile_pic_extension = 'jpg'
         if ((format_string_contains_key(self.dirname_pattern, 'profile') or
              format_string_contains_key(self.dirname_pattern, 'target'))):
-            filename = '{0}/{1}_UTC_profile_pic.{2}'.format(self.dirname_pattern.format(profile=profile.username.lower(),
-                                                                                        target=profile.username.lower()),
-                                                            _epoch_to_string(date_object), profile_pic_extension)
+            filename = '{0}/{1}_profile_pic.{2}'.format(self.dirname_pattern.format(profile=profile.username.lower(),
+                                                                                    target=profile.username.lower()),
+                                                        profile_pic_identifier, profile_pic_extension)
         else:
-            filename = '{0}/{1}_{2}_UTC_profile_pic.{3}'.format(self.dirname_pattern.format(), profile.username.lower(),
-                                                                _epoch_to_string(date_object), profile_pic_extension)
+            filename = '{0}/{1}_{2}_profile_pic.{3}'.format(self.dirname_pattern.format(), profile.username.lower(),
+                                                            profile_pic_identifier, profile_pic_extension)
         if os.path.isfile(filename):
             self.context.log(filename + ' already exists')
             return None
-        self.context.get_and_write_raw(profile_pic_url, filename)
-        os.utime(filename, (datetime.now().timestamp(), date_object.timestamp()))
+        self.context.write_raw(profile_pic_bytes if profile_pic_bytes else profile_pic_response, filename)
+        if date_object:
+            os.utime(filename, (datetime.now().timestamp(), date_object.timestamp()))
         self.context.log('')  # log output of _get_and_write_raw() does not produce \n
 
     @_requires_login
@@ -335,8 +356,19 @@ class Instaloader:
 
         :raises InvalidArgumentException: If the provided username does not exist.
         :raises BadCredentialsException: If the provided password is wrong.
-        :raises ConnectionException: If connection to Instagram failed."""
+        :raises ConnectionException: If connection to Instagram failed.
+        :raises TwoFactorAuthRequiredException: First step of 2FA login done, now call :meth:`Instaloader.two_factor_login`."""
         self.context.login(user, passwd)
+
+    def two_factor_login(self, two_factor_code) -> None:
+        """Second step of login if 2FA is enabled.
+        Not meant to be used directly, use :meth:`Instaloader.two_factor_login`.
+
+        :raises InvalidArgumentException: No two-factor authentication pending.
+        :raises BadCredentialsException: 2FA verification code invalid.
+
+        .. versionadded:: 4.2"""
+        self.context.two_factor_login(two_factor_code)
 
     def format_filename(self, item: Union[Post, StoryItem], target: Optional[str] = None):
         """Format filename of a :class:`Post` or :class:`StoryItem` according to ``filename-pattern`` parameter.
@@ -359,6 +391,7 @@ class Instaloader:
 
         # Download the image(s) / video thumbnail and videos within sidecars if desired
         downloaded = True
+        self._committed = self.check_if_committed(filename)
         if self.download_pictures:
             if post.typename == 'GraphSidecar':
                 edge_number = 1
@@ -629,6 +662,59 @@ class Instaloader:
             count += 1
             with self.context.error_catcher('Download saved posts'):
                 downloaded = self.download_post(post, target=':saved')
+                if fast_update and not downloaded:
+                    break
+
+    def get_location_posts(self, location: str) -> Iterator[Post]:
+        """Get Posts which are listed by Instagram for a given Location.
+
+        :return:  Iterator over Posts of a location's posts
+
+        .. versionadded:: 4.2
+        """
+        has_next_page = True
+        end_cursor = None
+        while has_next_page:
+            if end_cursor:
+                params = {'__a': 1, 'max_id': end_cursor}
+            else:
+                params = {'__a': 1}
+            location_data = self.context.get_json('explore/locations/{0}/'.format(location),
+                                                  params)['graphql']['location']['edge_location_to_media']
+            yield from (Post(self.context, edge['node']) for edge in location_data['edges'])
+            has_next_page = location_data['page_info']['has_next_page']
+            end_cursor = location_data['page_info']['end_cursor']
+
+    def download_location(self, location: str,
+                          max_count: Optional[int] = None,
+                          post_filter: Optional[Callable[[Post], bool]] = None,
+                          fast_update: bool = False) -> None:
+        """Download pictures of one location.
+
+        To download the last 30 pictures with location 362629379, do::
+
+            loader = Instaloader()
+            loader.download_location(362629379, max_count=30)
+
+        :param location: Location to download, as Instagram numerical ID
+        :param max_count: Maximum count of pictures to download
+        :param post_filter: function(post), which returns True if given picture should be downloaded
+        :param fast_update: If true, abort when first already-downloaded picture is encountered
+
+        .. versionadded:: 4.2
+        """
+        self.context.log("Retrieving pictures for location {}...".format(location))
+        count = 1
+        for post in self.get_location_posts(location):
+            if max_count is not None and count > max_count:
+                break
+            self.context.log('[{0:3d}] %{1} '.format(count, location), end='', flush=True)
+            if post_filter is not None and not post_filter(post):
+                self.context.log('<skipped>')
+                continue
+            count += 1
+            with self.context.error_catcher('Download location {}'.format(location)):
+                downloaded = self.download_post(post, target='%' + location)
                 if fast_update and not downloaded:
                     break
 
@@ -945,6 +1031,25 @@ class Instaloader:
                 if fast_update and not downloaded:
                     break
 
+    def check_if_committed(self, filename: str) -> bool:
+        """Checks to see if the current post has been committed.
+
+        A post is considered committed if its json metadata file exists and is not malformed.
+
+        .. versionadded:: 4.2
+        """
+        if os.path.isfile(filename + '.json.xz'):
+            filename += '.json.xz'
+        elif os.path.isfile(filename + '.json'):
+            filename += '.json'
+        else:
+            return False
+        try:
+            load_structure_from_file(self.context, filename)
+            return True
+        except (FileNotFoundError, lzma.LZMAError, json.decoder.JSONDecodeError):
+            return False
+
     def interactive_login(self, username: str) -> None:
         """Logs in and internally stores session, asking user for password interactively.
 
@@ -953,11 +1058,20 @@ class Instaloader:
         :raises ConnectionException: If connection to Instagram failed."""
         if self.context.quiet:
             raise LoginRequiredException("Quiet mode requires given password or valid session file.")
-        password = None
-        while password is None:
-            password = getpass.getpass(prompt="Enter Instagram password for %s: " % username)
-            try:
-                self.login(username, password)
-            except BadCredentialsException as err:
-                print(err, file=sys.stderr)
-                password = None
+        try:
+            password = None
+            while password is None:
+                password = getpass.getpass(prompt="Enter Instagram password for %s: " % username)
+                try:
+                    self.login(username, password)
+                except BadCredentialsException as err:
+                    print(err, file=sys.stderr)
+                    password = None
+        except TwoFactorAuthRequiredException:
+            while True:
+                try:
+                    code = input("Enter 2FA verification code: ")
+                    self.two_factor_login(code)
+                    break
+                except BadCredentialsException:
+                    pass

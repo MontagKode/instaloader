@@ -8,7 +8,7 @@ Instaloader is invoked with::
    $ instaloader [options] target [target ...]
 
 where ``target`` is a ``profile``, a ``"#hashtag"``, ``@profile`` (all profiles
-that *profile* is following), or if logged in ``:feed`` (pictures from your
+that *profile* is following), ``%location ID``, or if logged in ``:feed`` (pictures from your
 feed), ``:stories`` (stories of your followees) or ``:saved`` (collection of
 posts marked as saved).
 
@@ -171,7 +171,7 @@ Which Posts to Download
 .. option:: --count COUNT, -c
 
    Do not attempt to download more than COUNT posts.  Applies only to
-   ``#hashtag`` and ``:feed``.
+   ``#hashtag``, ``%location id``, and ``:feed``.
 
 
 Login (Download Private Profiles)
@@ -230,6 +230,14 @@ How to Download
    to ``3``. If a connection fails, it can be manually skipped by hitting
    :kbd:`Control-c`. Set this to ``0`` to retry infinitely.
 
+.. option:: --commit-mode
+
+   Tries to ensure downloaded images avoid corruption in case of unexpected
+   interruption. If the last picture is corrupted, Instaloader will fix the
+   picture the next time it is run.
+
+   .. versionadded:: 4.2
+
 Miscellaneous Options
 ^^^^^^^^^^^^^^^^^^^^^
 
@@ -241,18 +249,20 @@ Miscellaneous Options
 
 .. option:: +args.txt
 
-   Read arguments from file `args.txt`, a shortcut to provide argument from
-   file rather than command-line. This provide a convient way to hide login
-   info from CLI. and also can use for simplify managment of long arguments.
+   Read arguments from file `args.txt`, a shortcut to provide arguments from
+   file rather than command-line. This provides a convenient way to hide login
+   info from CLI, and can also be used to simplify managment of long arguments.
 
    .. note::
 
-      text file should separate arg with line break.
+      Text file should separate arguments with line breaks.
 
       args.txt example::
 
-         --login MYUSENAME
-         --password MYPASSWORD
+         --login=MYUSERNAME
+         --password=MYPASSWORD
          --fast-update
+         profile1
+         profile2
 
    .. versionadded:: 4.1

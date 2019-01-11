@@ -8,7 +8,8 @@ from argparse import ArgumentParser, SUPPRESS
 from typing import List, Optional
 
 from . import (Instaloader, InstaloaderException, InvalidArgumentException, Post, Profile, ProfileNotExistsException,
-               StoryItem, __version__, load_structure_from_file)
+               StoryItem, __version__, load_structure_from_file, TwoFactorAuthRequiredException,
+               BadCredentialsException)
 from .instaloader import get_default_session_filename
 from .instaloadercontext import default_user_agent
 
@@ -20,7 +21,7 @@ def usage_string():
     return """
 {0} [--comments] [--geotags] [--stories] [--highlights] [--tagged]
 {2:{1}} [--login YOUR-USERNAME] [--fast-update]
-{2:{1}} profile | "#hashtag" | :stories | :feed | :saved
+{2:{1}} profile | "#hashtag" | %%location_id | :stories | :feed | :saved
 {0} --help""".format(argv0, len(argv0), '')
 
 
@@ -84,7 +85,16 @@ def _main(instaloader: Instaloader, targetlist: List[str],
             instaloader.context.log("Session file does not exist yet - Logging in.")
         if not instaloader.context.is_logged_in or username != instaloader.test_login():
             if password is not None:
-                instaloader.login(username, password)
+                try:
+                    instaloader.login(username, password)
+                except TwoFactorAuthRequiredException:
+                    while True:
+                        try:
+                            code = input("Enter 2FA verification code: ")
+                            instaloader.two_factor_login(code)
+                            break
+                        except BadCredentialsException:
+                            pass
             else:
                 instaloader.interactive_login(username)
         instaloader.context.log("Logged in as %s." % username)
@@ -130,6 +140,9 @@ def _main(instaloader: Instaloader, targetlist: List[str],
                                                  post_filter=post_filter)
                 elif target[0] == '-':
                     instaloader.download_post(Post.from_shortcode(instaloader.context, target[1:]), target)
+                elif target[0] == "%":
+                    instaloader.download_location(location=target[1:], max_count=max_count, fast_update=fast_update,
+                                                  post_filter=post_filter)
                 elif target == ":feed":
                     instaloader.download_feed_posts(fast_update=fast_update, max_count=max_count,
                                                     post_filter=post_filter)
@@ -208,6 +221,7 @@ def main():
                            help="Download all followees of profile. Requires --login. "
                                 "Consider using :feed rather than @yourself.")
     g_targets.add_argument('_hashtag', nargs='*', metavar='"#hashtag"', help="Download #hashtag.")
+    g_targets.add_argument('_location', nargs='*', metavar='%location_id', help="Download %%location_id.")
     g_targets.add_argument('_feed', nargs='*', metavar=":feed",
                            help="Download pictures from your feed. Requires --login.")
     g_targets.add_argument('_stories', nargs='*', metavar=":stories",
@@ -320,6 +334,10 @@ def main():
                        help='Maximum number of connection attempts until a request is aborted. Defaults to 3. If a '
                             'connection fails, it can be manually skipped by hitting CTRL+C. Set this to 0 to retry '
                             'infinitely.')
+    g_how.add_argument('--commit-mode', action='store_true',
+                       help='Tries to ensure downloaded images avoid corruption in case of unexpected interruption. '
+                       'If the last picture is corrupted, Instaloader will fix the picture the next time it is run. '
+                       'Requires the JSON metadata to be saved.')
 
     g_misc = parser.add_argument_group('Miscellaneous Options')
     g_misc.add_argument('-q', '--quiet', action='store_true',
@@ -361,6 +379,9 @@ def main():
         download_posts = not (args.no_posts or args.stories_only or args.profile_pic_only)
         download_stories = args.stories or args.stories_only
 
+        if args.commit_mode and args.no_metadata_json:
+            raise SystemExit('--commit-mode requires JSON metadata to be saved.')
+
         loader = Instaloader(sleep=not args.no_sleep, quiet=args.quiet, user_agent=args.user_agent,
                              dirname_pattern=args.dirname_pattern, filename_pattern=args.filename_pattern,
                              download_pictures=not args.no_pictures,
@@ -371,7 +392,8 @@ def main():
                              post_metadata_txt_pattern=post_metadata_txt_pattern,
                              storyitem_metadata_txt_pattern=storyitem_metadata_txt_pattern,
                              graphql_rate_limit=args.graphql_rate_limit,
-                             max_connection_attempts=args.max_connection_attempts)
+                             max_connection_attempts=args.max_connection_attempts,
+                             commit_mode=args.commit_mode)
         _main(loader,
               args.profile,
               username=args.login.lower() if args.login is not None else None,

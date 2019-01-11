@@ -10,7 +10,7 @@ import time
 import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Iterator, Optional
+from typing import Any, Callable, Dict, Iterator, Optional, Union
 
 import requests
 import requests.utils
@@ -59,6 +59,7 @@ class InstaloaderContext:
         self._graphql_page_length = 50
         self.graphql_count_per_slidingwindow = graphql_count_per_slidingwindow or 200
         self._root_rhx_gis = None
+        self.two_factor_auth_pending = None
 
         # error log, filled with error() and printed at the end of Instaloader.main()
         self.error_log = []
@@ -180,23 +181,39 @@ class InstaloaderContext:
 
         :raises InvalidArgumentException: If the provided username does not exist.
         :raises BadCredentialsException: If the provided password is wrong.
-        :raises ConnectionException: If connection to Instagram failed."""
+        :raises ConnectionException: If connection to Instagram failed.
+        :raises TwoFactorAuthRequiredException: First step of 2FA login done, now call :meth:`Instaloader.two_factor_login`."""
         import http.client
         # pylint:disable=protected-access
         http.client._MAXHEADERS = 200
         session = requests.Session()
         session.cookies.update({'sessionid': '', 'mid': '', 'ig_pr': '1',
-                                'ig_vw': '1920', 'csrftoken': '',
+                                'ig_vw': '1920', 'ig_cb': '1', 'csrftoken': '',
                                 's_network': '', 'ds_user_id': ''})
         session.headers.update(self._default_http_header())
-        session.headers.update({'X-CSRFToken': self.get_json('', {})['config']['csrf_token']})
+        session.get('https://www.instagram.com/web/__mid/')
+        csrf_token = session.cookies.get_dict()['csrftoken']
+        session.headers.update({'X-CSRFToken': csrf_token})
         # Not using self.get_json() here, because we need to access csrftoken cookie
         self._sleep()
         login = session.post('https://www.instagram.com/accounts/login/ajax/',
                              data={'password': passwd, 'username': user}, allow_redirects=True)
-        if login.status_code != 200:
-            raise ConnectionException("Login error: {} {}".format(login.status_code, login.reason))
-        resp_json = login.json()
+        try:
+            resp_json = login.json()
+        except json.decoder.JSONDecodeError:
+            raise ConnectionException("Login error: JSON decode fail, {} - {}.".format(login.status_code, login.reason))
+        if resp_json.get('two_factor_required'):
+            two_factor_session = copy_session(session)
+            two_factor_session.headers.update({'X-CSRFToken': csrf_token})
+            two_factor_session.cookies.update({'csrftoken': csrf_token})
+            self.two_factor_auth_pending = (two_factor_session,
+                                            user,
+                                            resp_json['two_factor_info']['two_factor_identifier'])
+            raise TwoFactorAuthRequiredException("Login error: two-factor authentication required.")
+        if resp_json.get('checkpoint_url'):
+            raise ConnectionException("Login: Checkpoint required. Point your browser to "
+                                      "https://www.instagram.com{}, "
+                                      "follow the instructions, then retry.".format(resp_json.get('checkpoint_url')))
         if resp_json['status'] != 'ok':
             if 'message' in resp_json:
                 raise ConnectionException("Login error: \"{}\" status, message \"{}\".".format(resp_json['status'],
@@ -217,6 +234,32 @@ class InstaloaderContext:
         session.headers.update({'X-CSRFToken': login.cookies['csrftoken']})
         self._session = session
         self.username = user
+
+    def two_factor_login(self, two_factor_code):
+        """Second step of login if 2FA is enabled.
+        Not meant to be used directly, use :meth:`Instaloader.two_factor_login`.
+
+        :raises InvalidArgumentException: No two-factor authentication pending.
+        :raises BadCredentialsException: 2FA verification code invalid.
+
+        .. versionadded:: 4.2"""
+        if not self.two_factor_auth_pending:
+            raise InvalidArgumentException("No two-factor authentication pending.")
+        (session, user, two_factor_id) = self.two_factor_auth_pending
+
+        login = session.post('https://www.instagram.com/accounts/login/ajax/two_factor/',
+                             data={'username': user, 'verificationCode': two_factor_code, 'identifier': two_factor_id},
+                             allow_redirects=True)
+        resp_json = login.json()
+        if resp_json['status'] != 'ok':
+            if 'message' in resp_json:
+                raise BadCredentialsException("Login error: {}".format(resp_json['message']))
+            else:
+                raise BadCredentialsException("Login error: \"{}\" status.".format(resp_json['status']))
+        session.headers.update({'X-CSRFToken': login.cookies['csrftoken']})
+        self._session = session
+        self.username = user
+        self.two_factor_auth_pending = None
 
     def _sleep(self):
         """Sleep a short time if self.sleep is set. Called before each request to instagram.com."""
@@ -386,8 +429,17 @@ class InstaloaderContext:
             data = _query()
             yield from (edge['node'] for edge in data['edges'])
 
-    def get_and_write_raw(self, url: str, filename: str, _attempt=1) -> None:
-        """Downloads raw data.
+    def write_raw(self, resp: Union[bytes, requests.Response], filename: str) -> None:
+        """Write raw response data into a file."""
+        self.log(filename, end=' ', flush=True)
+        with open(filename, 'wb') as file:
+            if isinstance(resp, requests.Response):
+                shutil.copyfileobj(resp.raw, file)
+            else:
+                file.write(resp)
+
+    def get_raw(self, url: str, _attempt=1) -> requests.Response:
+        """Downloads a file anonymously.
 
         :raises QueryReturnedNotFoundException: When the server responds with a 404.
         :raises QueryReturnedForbiddenException: When the server responds with a 403.
@@ -396,10 +448,8 @@ class InstaloaderContext:
             with self.get_anonymous_session() as anonymous_session:
                 resp = anonymous_session.get(url, stream=True)
             if resp.status_code == 200:
-                self.log(filename, end=' ', flush=True)
-                with open(filename, 'wb') as file:
-                    resp.raw.decode_content = True
-                    shutil.copyfileobj(resp.raw, file)
+                resp.raw.decode_content = True
+                return resp
             else:
                 if resp.status_code == 403:
                     # suspected invalid URL signature
@@ -415,10 +465,18 @@ class InstaloaderContext:
             self.error(error_string + " [retrying; skip with ^C]", repeat_at_end=False)
             try:
                 self._sleep()
-                self.get_and_write_raw(url, filename, _attempt + 1)
+                return self.get_raw(url, _attempt + 1)
             except KeyboardInterrupt:
                 self.error("[skipped by user]", repeat_at_end=False)
                 raise ConnectionException(error_string) from err
+
+    def get_and_write_raw(self, url: str, filename: str) -> None:
+        """Downloads and writes anonymously-requested raw data into a file.
+
+        :raises QueryReturnedNotFoundException: When the server responds with a 404.
+        :raises QueryReturnedForbiddenException: When the server responds with a 403.
+        :raises ConnectionException: When download repeatedly failed."""
+        self.write_raw(self.get_raw(url), filename)
 
     @property
     def root_rhx_gis(self) -> Optional[str]:

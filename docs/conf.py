@@ -20,8 +20,7 @@
 import os
 import subprocess
 import sys
-
-import sphinx_bootstrap_theme
+import typing
 
 sys.path.insert(0, os.path.abspath('..'))
 
@@ -123,7 +122,7 @@ add_module_names = False
 # show_authors = False
 
 # The name of the Pygments (syntax highlighting) style to use.
-pygments_style = 'sphinx'
+pygments_style = 'fruity'
 
 # A list of ignored prefixes for module index sorting.
 # modindex_common_prefix = []
@@ -140,20 +139,7 @@ todo_include_todos = False
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = 'bootstrap'
-html_theme_path = sphinx_bootstrap_theme.get_html_theme_path()
-
-# Theme options are theme-specific and customize the look and feel of a theme
-# further.  For a list of options available for each theme, see the
-# documentation.
-#
-html_theme_options = {
-    'navbar_site_name': 'Site Contents',
-    'navbar_pagenav_name': 'Page Contents',
-    'navbar_pagenav': True,
-    'navbar_sidebarrel': True,
-    'nosidebar': True,
-     }
+html_theme = 'basic'
 
 # Add any paths that contain custom themes here, relative to this directory.
 # html_theme_path = []
@@ -374,6 +360,7 @@ html_context = {'current_release': current_release, 'current_release_date': curr
 
 
 def setup(app):
-    app.add_stylesheet("style.css")
+    typing.TYPE_CHECKING = True
+    app.add_stylesheet("instaloader.css")
     app.connect('autodoc-process-signature', sphinx_autodoc_typehints.process_signature)
     app.connect('autodoc-process-docstring', sphinx_autodoc_typehints.process_docstring)
